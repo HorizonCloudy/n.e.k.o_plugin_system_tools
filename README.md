@@ -52,13 +52,9 @@ Windows-MCP（[CursorTouch/Windows-MCP](https://github.com/CursorTouch/Windows-M
 - 每次启动、每次 Windows-MCP 调用、每次被拦事件都追加 `data/audit/audit.log`（JSON 行）。
 - uvx 默认钉死 `windows-mcp==0.8.9`（按该版本实测）；旧配置 `args = "windows-mcp serve"` 会被自动替换为钉版命令。
 - Windows-MCP 的系统级工具默认拦截；鼠标键盘类工具会真实操作桌面，由模型显式调用。
-- 宿主对单次 run 有 300s 执行超时（外部 `/runs`）；`tuba_update` 下载中断后重跑会复用已完成的包继续安装。
+- 宿主对单次 run 有 300s 执行超时（外部 `/runs`）；`tuba_update` 下载中断后重跑会复用已完成的包，静默安装最多盯 120s，没装完转后台并提示用 `tuba_detect` 复查；同版本重装会被该 Inno 包拒绝（退出码非 0，如实上报）。
 - `uvx` 子进程挂在 Job Object 上（KILL_ON_JOB_CLOSE）：插件进程消失时子进程树一起被系统回收，不留孤儿。
 
 ## 自检
 
 `python selfcheck.py`：校验解包、工具名、参数拆分、输出解码、版本归一化与最新版倒探（假 probe 不联网）、高危名单/路径边界/下载哈希（本地回环服务器）、签名探测，并实测 hex2dec、注册表探测和 Windows-MCP 假服务器协议全链路。
-
----
-
-包：dist\system_tools-0.5.0.neko-plugin（36395 B，sha256 09920D5FE01D8F9232401B241D4962CC75EC8CB0AD9FE31AED6E8E218A69F227，本地构建不入库）。

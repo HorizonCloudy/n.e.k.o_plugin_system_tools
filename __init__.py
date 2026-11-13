@@ -250,7 +250,7 @@ class SystemToolsPlugin(NekoPluginBase):
         name="更新图吧工具箱到最新版",
         description="下载并安装最新版：探测镜像上最新的 YYYYMM 安装包（从当月逐月往回探）；已装版本不低于最新就跳过并说明原因。有更新时下载到数据目录并静默安装（/VERYSILENT /NORESTART），装完重读注册表确认版本。force=true 时版本相同也重装；silent=false 弹安装界面由用户手点。",
         timeout=1800,
-        llm_result_fields=["updated", "reason", "installed_before", "latest_month", "installer", "bytes", "exit_code", "installed_after", "note"],
+        llm_result_fields=["updated", "reason", "installed_before", "latest_month", "installer", "bytes", "sha256", "signature", "reused", "exit_code", "install_state", "installed_after", "note"],
     )
     async def tuba_update(
         self,
@@ -283,34 +283,46 @@ class SystemToolsPlugin(NekoPluginBase):
         sig = await asyncio.to_thread(_tools.signature_state, exe)
         exit_code = None
         installed_after = None
+        install_state = "done"
         note = ""
         if silent:
-            try:
-                r = await asyncio.to_thread(
-                    subprocess.run, [str(exe), "/VERYSILENT", "/NORESTART"], timeout=900
+            # 宿主对单次 run 有 300s 上限：安装最多盯 120s，没退出就转后台报状态。
+            p_inst = await asyncio.to_thread(
+                subprocess.Popen, [str(exe), "/VERYSILENT", "/NORESTART"], cwd=str(exe.parent)
+            )
+            waited = 0.0
+            while p_inst.poll() is None and waited < 120:
+                await asyncio.sleep(5)
+                waited += 5
+            exit_code = p_inst.poll()
+            if exit_code is None:
+                install_state = "running_in_background"
+                note = "安装器仍在后台运行（正常，大包解压慢），完成后用 tuba_detect 复查版本"
+            elif exit_code != 0:
+                install_state = "failed"
+                note = (
+                    f"安装器退出码 {exit_code}，未生效"
+                    "（同版本重装会被该 Inno 包拒绝；真·新版本升级或 silent=false 交互安装再试）"
                 )
-                exit_code = r.returncode
-                if exit_code != 0:
-                    note = f"安装器退出码 {exit_code}，可能未完成"
-            except subprocess.TimeoutExpired:
-                note = "安装进程 900s 未退出，可能需要前台确认"
-            reg2 = await asyncio.to_thread(_tools.tuba_from_registry)
-            installed_after = (reg2 or {}).get("version")
-            if not note and installed_after:
-                note = f"安装后版本 {installed_after}"
+            if exit_code is not None:
+                reg2 = await asyncio.to_thread(_tools.tuba_from_registry)
+                installed_after = (reg2 or {}).get("version")
+                if exit_code == 0 and installed_after:
+                    note = f"安装后版本 {installed_after}"
         else:
             p = await asyncio.to_thread(subprocess.Popen, [str(exe)], cwd=str(exe.parent))
             note = f"交互式安装器已启动 pid={p.pid}，需用户手动点完"
         if sig != "trusted":
             note = (note + f"；安装包签名状态 {sig}（信息级，不阻断，第三方镜像来源请自行判断）").strip("；")
         self._audit("tuba_update", updated=True, month=found["month"], sha256=dl.get("sha256"),
-                    signature=sig, exit_code=exit_code)
+                    signature=sig, exit_code=exit_code, install_state=install_state)
         return Ok({
             "updated": True, "installed_before": before,
             "installed_before_key": installed_key, "latest_month": found["month"],
             "installer": str(exe), "bytes": dl.get("bytes"), "sha256": dl.get("sha256"),
             "reused": bool(dl.get("reused")), "signature": sig, "silent": silent,
-            "exit_code": exit_code, "installed_after": installed_after, "note": note,
+            "exit_code": exit_code, "install_state": install_state,
+            "installed_after": installed_after, "note": note,
         })
 
     @plugin_entry(
