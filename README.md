@@ -58,3 +58,7 @@ Windows-MCP（[CursorTouch/Windows-MCP](https://github.com/CursorTouch/Windows-M
 ## 自检
 
 `python selfcheck.py`：校验解包、工具名、参数拆分、输出解码、版本归一化与最新版倒探（假 probe 不联网）、高危名单/路径边界/下载哈希（本地回环服务器）、签名探测，并实测 hex2dec、注册表探测和 Windows-MCP 假服务器协议全链路。
+
+---
+
+包：dist\system_tools-0.5.0.neko-plugin（37642 B，sha256 0F3C666298F71EDD0D34C862E183D794F8C6F9CE26750BE34088ED1B08D0F220，本地构建不入库）。
