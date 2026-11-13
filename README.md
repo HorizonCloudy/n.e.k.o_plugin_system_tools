@@ -61,4 +61,4 @@ Windows-MCP（[CursorTouch/Windows-MCP](https://github.com/CursorTouch/Windows-M
 
 ---
 
-包：dist\system_tools-0.5.1.neko-plugin（37642 B，sha256 7D464DDF28C438A1EAE3C1DC881C80FDAEDA049E6D81402362F5106F49B7DCB9，本地构建不入库）。0.5.0 同内容仅版本号不同；v0.5.0 tag 指向 b7e0c68（含安全加固、不含安装窗口修复），最终代码看 v0.5.1。
+包：dist\system_tools-0.6.0.neko-plugin（37642 B，sha256 9C44718B5D04B5327FD96F8948B94000A5D526B31C8A1F2DAE08075F31D03D48，本地构建不入库）。Tag 血缘：v0.5.0@b7e0c68（安全加固，缺安装窗口修复）；v0.6.0 应钉在 manifest=0.6.0 的提交上（把 tag 快进到当前 main 即可）。

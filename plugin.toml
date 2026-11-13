@@ -18,7 +18,7 @@ keywords = [
     "桌面自动化",
     "截图",
 ]
-version = "0.5.1"
+version = "0.6.0"
 type = "plugin"
 entry = "plugin.plugins.system_tools:SystemToolsPlugin"
 
