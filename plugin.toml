@@ -18,7 +18,7 @@ keywords = [
     "桌面自动化",
     "截图",
 ]
-version = "0.3.0"
+version = "0.4.0"
 type = "plugin"
 entry = "plugin.plugins.system_tools:SystemToolsPlugin"
 
@@ -45,8 +45,8 @@ root = "D:\\SysinternalsSuite"
 zip = "C:\\Users\\54301\\Downloads\\SysinternalsSuite.zip"
 
 [tuba]
-# 图吧工具箱 202608 安装包下载地址。
-url = "https://apac.tualatin.club/%E5%9B%BE%E5%90%A7%E5%B7%A5%E5%85%B7%E7%AE%B1202608%E5%AE%89%E8%A3%85%E5%8C%85.exe"
+# 最新版探测模板：{ym} 会被替换成 YYYYMM（从当月往回逐月探测）。留空用代码内置默认镜像。
+url_template = "https://apac.tualatin.club/%E5%9B%BE%E5%90%A7%E5%B7%A5%E5%85%B7%E7%AE%B1{ym}%E5%AE%89%E8%A3%85%E5%8C%85.exe"
 
 [windows_mcp]
 # Windows-MCP 启动命令（stdio MCP server）。默认 uvx；首次运行会拉 Python 3.13+ 和依赖。
@@ -56,3 +56,17 @@ start_timeout_seconds = 240
 # 默认拦截的系统级工具（PowerShell/FileSystem/Registry/Process/Clipboard）。blocked 给值=整表覆盖；allow 逗号名单=从拦截表摘除。
 blocked = ""
 allow = ""
+
+# ---------------------------------------------------------------------------
+# Hosted TSX 面板：插件管理器里的操作界面。
+# ---------------------------------------------------------------------------
+
+[plugin.ui]
+enabled = true
+
+[[plugin.ui.panel]]
+id = "panel"
+title = "系统工具"
+entry = "ui/panel.tsx"
+context = "system_tools_panel"
+permissions = ["state:read", "action:call"]

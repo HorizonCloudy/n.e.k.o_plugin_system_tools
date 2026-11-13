@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import re
 import shlex
 import subprocess
 import sys
@@ -15,6 +16,8 @@ from pathlib import Path
 MAX_CAPTURE_CHARS = 4000
 DOWNLOAD_UA = "Mozilla/5.0 (compatible; NEKO-system-tools/0.1)"
 TUBA_NAME_HINT = "图吧工具箱"
+# 镜像按 图吧工具箱YYYYMM安装包.exe 命名；{ym} 由代码替换。
+TUBA_URL_TEMPLATE = "https://apac.tualatin.club/%E5%9B%BE%E5%90%A7%E5%B7%A5%E5%85%B7%E7%AE%B1{ym}%E5%AE%89%E8%A3%85%E5%8C%85.exe"
 
 
 def safe_tool_exe(root: Path, name: str) -> Path | None:
@@ -78,13 +81,56 @@ def split_args(text: str) -> list[str]:
     return out
 
 
+def pid_by_image(image_name: str) -> int | None:
+    """tasklist 按镜像名找第一个匹配 pid；找不到返回 None。"""
+    r = subprocess.run(
+        ["tasklist", "/FI", f"IMAGENAME eq {image_name}", "/FO", "CSV", "/NH"],
+        capture_output=True, text=True,
+    )
+    for line in (r.stdout or "").splitlines():
+        parts = line.split('","')
+        if len(parts) >= 2 and parts[0].strip('"').lower() == image_name.lower():
+            try:
+                return int(parts[1])
+            except ValueError:
+                pass
+    return None
+
+
+def shell_execute_runas(exe: Path, argv: list[str]) -> int | None:
+    """runas 动词经 UAC 提权启动；用户拒绝或启动后找不到进程返回 None。
+
+    shortcut: ShellExecuteW 不回传进程句柄，pid 靠 tasklist 按镜像名回查；
+    同名多实例时取第一个。要精确句柄再换 ShellExecuteExW+正确结构体。
+    """
+    import ctypes
+    import ctypes.wintypes as wt
+
+    shell32 = ctypes.windll.shell32
+    shell32.ShellExecuteW.restype = ctypes.c_void_p
+    shell32.ShellExecuteW.argtypes = [wt.HWND, wt.LPCWSTR, wt.LPCWSTR, wt.LPCWSTR, wt.LPCWSTR, ctypes.c_int]
+    h = shell32.ShellExecuteW(None, "runas", str(exe), subprocess.list2cmdline(list(argv)), str(exe.parent), 1)
+    if not h or int(h) <= 32:
+        return None
+    return pid_by_image(exe.name)
+
+
 def run_exe(exe: Path, argv: list[str], *, wait: bool, timeout_seconds: int, accept_eula: bool) -> dict:
     cmd = [str(exe)] + list(argv)
     if accept_eula and not any(a.lower() in ("/accepteula", "-accepteula") for a in argv):
         cmd.append("/accepteula")
     if not wait:
-        p = subprocess.Popen(cmd, cwd=str(exe.parent))
-        return {"mode": "launched", "pid": p.pid, "tool": exe.name}
+        try:
+            p = subprocess.Popen(cmd, cwd=str(exe.parent))
+            return {"mode": "launched", "pid": p.pid, "tool": exe.name}
+        except OSError as exc:
+            if getattr(exc, "winerror", None) != 740:  # 只有"要求提权"才走 UAC
+                return {"mode": "error", "tool": exe.name, "note": f"{type(exc).__name__}: {exc}"}
+            pid = shell_execute_runas(exe, argv)
+            if pid is None:
+                return {"mode": "error", "tool": exe.name, "note": "UAC 被拒绝/取消，或提权后没找到进程"}
+            return {"mode": "launched", "pid": pid, "tool": exe.name, "elevated": True,
+                    "note": "普通启动需要管理员，已经 UAC 确认后启动"}
     try:
         r = subprocess.run(cmd, cwd=str(exe.parent), capture_output=True, timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
@@ -163,6 +209,61 @@ def find_tuba_exe(install_location: str) -> Path | None:
         if cands:
             return max(cands, key=lambda p: (p.stat().st_mtime, p.name))
     return None
+
+
+def tuba_version_key(display: str) -> str:
+    """版本串归一化成 YYYYMM 便于排序："2026.08"/"图吧工具箱202608"→"202608"；无匹配→空串。"""
+    m = re.search(r"(20\d{2})[.\-_ ]?(\d{1,2})", display or "")
+    if not m:
+        return ""
+    month = int(m.group(2))
+    return f"{m.group(1)}{month:02d}" if 1 <= month <= 12 else ""
+
+
+def tuba_candidate_months(year: int, month: int, back: int = 12) -> list[str]:
+    """从给定年月起逐月往回生成 YYYYMM 候选（新→旧）。"""
+    out: list[str] = []
+    for _ in range(back):
+        out.append(f"{year}{month:02d}")
+        month -= 1
+        if month == 0:
+            year, month = year - 1, 12
+    return out
+
+
+def url_available(url: str, timeout: float = 15) -> bool:
+    """只取第 1 字节的 Range GET 探测文件是否存在；200/206 都算在。失败重试一次。"""
+    import time as _time
+
+    for attempt in (0, 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": DOWNLOAD_UA, "Range": "bytes=0-0"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status in (200, 206)
+        except Exception:
+            if attempt == 0:
+                _time.sleep(2)
+    return False
+
+
+def tuba_find_latest(installed_key: str, today=None, template: str = TUBA_URL_TEMPLATE,
+                     probe=url_available, back: int = 12) -> dict:
+    """从当月往回探测最新可达安装包，不探比已装更旧的月份。
+
+    month="" 表示没探到任何不低于已装版本的包；newer=是否比已装新。
+    """
+    if "{ym}" not in template:
+        return {"ok": False, "error": "url_template 必须含 {ym}"}
+    if today is None:
+        import datetime
+        today = datetime.date.today()
+    for ym in tuba_candidate_months(today.year, today.month, back):
+        if installed_key and ym < installed_key:
+            break
+        url = template.replace("{ym}", ym)
+        if probe(url):
+            return {"ok": True, "month": ym, "url": url, "newer": ym > installed_key}
+    return {"ok": True, "month": "", "url": "", "newer": False}
 
 
 def download_file(url: str, dest_dir: Path, filename: str = "") -> dict:

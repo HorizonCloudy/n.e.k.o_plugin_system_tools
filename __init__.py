@@ -1,7 +1,7 @@
 """system_tools：把 Sysinternals Suite 和图吧工具箱的能力交给 N.E.K.O.。
 
 Sysinternals 优先用现成目录，没有就从 zip 解包到插件数据目录；图吧工具箱经
-卸载注册表定位，可启动主程序、下载并运行安装包。全部文件/进程操作在本插件
+卸载注册表定位，可启动主程序、探测并安装最新版。全部文件/进程操作在本插件
 独立进程内完成，不注入被启动的工具，不主动提权。
 """
 from __future__ import annotations
@@ -24,6 +24,7 @@ from plugin.sdk.plugin import (
     llm_tool,
     neko_plugin,
     plugin_entry,
+    ui,
 )
 
 from . import _tools
@@ -193,10 +194,11 @@ class SystemToolsPlugin(NekoPluginBase):
     async def tuba_detect(self):
         reg = await asyncio.to_thread(_tools.tuba_from_registry)
         if not reg:
-            return Err(SdkError("注册表里没有图吧工具箱的安装记录。可先 tuba_download + tuba_install。"))
+            return Err(SdkError("注册表里没有图吧工具箱的安装记录。可先 tuba_update 下载并安装最新版。"))
         exe = await asyncio.to_thread(_tools.find_tuba_exe, reg["install_location"])
         return Ok({**reg, "main_exe": str(exe) if exe else None})
 
+    @ui.action(label="启动图吧工具箱", tone="default", group="tuba", order=10)
     @plugin_entry(
         id="tuba_launch",
         name="启动图吧工具箱",
@@ -214,25 +216,67 @@ class SystemToolsPlugin(NekoPluginBase):
         p = await asyncio.to_thread(subprocess.Popen, [str(exe)], cwd=str(exe.parent))
         return Ok({"mode": "launched", "pid": p.pid, "exe": str(exe)})
 
+    @ui.action(label="检查并安装最新版", tone="primary", group="tuba", order=20,
+               confirm="将下载并覆盖安装最新版图吧工具箱")
     @plugin_entry(
-        id="tuba_download",
-        name="下载图吧工具箱安装包",
-        description="从配置的 URL（默认 202608 安装包）下载安装包到插件数据目录 tuba/。文件数百 MB，耗时较长。",
+        id="tuba_update",
+        name="更新图吧工具箱到最新版",
+        description="下载并安装最新版：探测镜像上最新的 YYYYMM 安装包（从当月逐月往回探）；已装版本不低于最新就跳过并说明原因。有更新时下载到数据目录并静默安装（/VERYSILENT /NORESTART），装完重读注册表确认版本。force=true 时版本相同也重装；silent=false 弹安装界面由用户手点。",
         timeout=1800,
+        llm_result_fields=["updated", "reason", "installed_before", "latest_month", "installer", "bytes", "exit_code", "installed_after", "note"],
     )
-    async def tuba_download(
+    async def tuba_update(
         self,
-        url: Annotated[str, "安装包 URL；空=配置 [tuba].url"] = "",
-        filename: Annotated[str, "保存文件名；空=取 URL 文件名"] = "",
+        force: Annotated[bool, "true=镜像没有更新的包也重装"] = False,
+        silent: Annotated[bool, "true=静默安装并等装完回读版本"] = True,
+        url_template: Annotated[str, "必须含 {ym} 的 URL 模板；空=配置 [tuba].url_template，再空=内置默认镜像"] = "",
     ):
         cfg = await self._sec("tuba")
-        use = url or str(cfg.get("url") or "")
-        if not use:
-            return Err(SdkError("未给 URL 且配置 [tuba].url 为空"))
-        result = await asyncio.to_thread(_tools.download_file, use, self._data("tuba"), filename)
-        if not result.get("ok"):
-            return Err(SdkError(result.get("error", "下载失败")))
-        return Ok(result)
+        tpl = url_template or str(cfg.get("url_template") or "") or _tools.TUBA_URL_TEMPLATE
+        reg = await asyncio.to_thread(_tools.tuba_from_registry)
+        installed_key = _tools.tuba_version_key(str((reg or {}).get("version") or ""))
+        found = await asyncio.to_thread(_tools.tuba_find_latest, installed_key, None, tpl)
+        if not found.get("ok"):
+            return Err(SdkError(found.get("error", "探测失败")))
+        before = (reg or {}).get("version")
+        if not found["month"]:
+            if not force:
+                return Ok({"updated": False, "installed_before": before, "latest_month": None,
+                           "reason": f"已装 {installed_key or '无'} 不低于镜像最新，跳过"})
+            return Err(SdkError("镜像按月往回探 12 个月没有可用安装包"))
+        if not found["newer"] and not force:
+            return Ok({"updated": False, "installed_before": before, "latest_month": found["month"],
+                       "reason": f"已装 {installed_key} 即最新，跳过"})
+        dl = await asyncio.to_thread(_tools.download_file, found["url"], self._data("tuba"))
+        if not dl.get("ok"):
+            return Err(SdkError("下载失败: " + str(dl.get("error"))))
+        exe = Path(dl["file"])
+        exit_code = None
+        installed_after = None
+        note = ""
+        if silent:
+            try:
+                r = await asyncio.to_thread(
+                    subprocess.run, [str(exe), "/VERYSILENT", "/NORESTART"], timeout=900
+                )
+                exit_code = r.returncode
+                if exit_code != 0:
+                    note = f"安装器退出码 {exit_code}，可能未完成"
+            except subprocess.TimeoutExpired:
+                note = "安装进程 900s 未退出，可能需要前台确认"
+            reg2 = await asyncio.to_thread(_tools.tuba_from_registry)
+            installed_after = (reg2 or {}).get("version")
+            if not note and installed_after:
+                note = f"安装后版本 {installed_after}"
+        else:
+            p = await asyncio.to_thread(subprocess.Popen, [str(exe)], cwd=str(exe.parent))
+            note = f"交互式安装器已启动 pid={p.pid}，需用户手动点完"
+        return Ok({
+            "updated": True, "installed_before": before,
+            "installed_before_key": installed_key, "latest_month": found["month"],
+            "installer": str(exe), "bytes": dl.get("bytes"), "silent": silent,
+            "exit_code": exit_code, "installed_after": installed_after, "note": note,
+        })
 
     @plugin_entry(
         id="tuba_install",
@@ -254,12 +298,64 @@ class SystemToolsPlugin(NekoPluginBase):
             ) if tuba_dir.is_dir() else []
             exe = cands[0] if cands else None
         if exe is None or not exe.is_file():
-            return Err(SdkError("没找到安装包。先调 tuba_download。"))
+            return Err(SdkError("没找到安装包。先调 tuba_update。"))
         cmd = [str(exe)] + (["/SILENT"] if silent else [])
         p = await asyncio.to_thread(subprocess.Popen, cmd, cwd=str(exe.parent))
         return Ok({"mode": "launched", "pid": p.pid, "installer": str(exe), "silent": bool(silent)})
 
     # ---------------------------------------------------------------- windows_mcp
+
+    @ui.action(label="打开工具并截屏观察", tone="default", group="operate", order=10)
+    @plugin_entry(
+        id="operate_tool",
+        name="启动工具并截屏观察",
+        description="按电脑当前情况操控软件的第一步：启动 Sysinternals 工具（source=sysinternals, name=工具名如 Procexp64/DiskView/AutoRuns/Tcpview）或图吧工具箱（source=tuba），等 GUI 出现后用 Windows-MCP Snapshot 抓界面文本和截图，返回快照文本+截图路径。之后用 wmcp_call 的 Click/Type/Shortcut/Scroll 操作界面，每步操作后再截屏确认变化。close_after=true 抓完按 pid 优雅关闭该程序（taskkill 发 WM_CLOSE，不碰其它窗口）。",
+        timeout=300,
+        llm_result_fields=["launched", "exe", "pid", "text", "files", "closed", "note"],
+    )
+    async def operate_tool(
+        self,
+        source: Annotated[str, "sysinternals 或 tuba"],
+        name: Annotated[str, "source=sysinternals 时的工具名；source=tuba 忽略"] = "",
+        wait_seconds: Annotated[int, "启动后等几秒再截屏，1~30"] = 3,
+        close_after: Annotated[bool, "截屏后按 pid 优雅关闭该程序"] = False,
+    ):
+        if source == "sysinternals":
+            root = await self._sys_root()
+            if not root:
+                return Err(SdkError("未找到可用的 Sysinternals 目录。先调 sysinternals_setup。"))
+            exe = _tools.safe_tool_exe(root, name)
+            if exe is None:
+                return Err(SdkError(f"工具不存在或名称非法: {name}"))
+        elif source == "tuba":
+            reg = await asyncio.to_thread(_tools.tuba_from_registry)
+            exe = await asyncio.to_thread(_tools.find_tuba_exe, reg["install_location"]) if reg else None
+            if exe is None:
+                return Err(SdkError("找不到图吧工具箱主程序。先 tuba_update 安装。"))
+        else:
+            return Err(SdkError("source 只能是 sysinternals 或 tuba"))
+        started = await asyncio.to_thread(
+            _tools.run_exe, exe, [], wait=False, timeout_seconds=1, accept_eula=True
+        )
+        await asyncio.sleep(max(1, min(int(wait_seconds or 3), 30)))
+        snap = await self.wmcp_call("Snapshot", "")
+        if not isinstance(snap, Ok):
+            return snap
+        closed = False
+        pid = started.get("pid")
+        if close_after and pid:
+            r = await asyncio.to_thread(
+                subprocess.run, ["taskkill", "/PID", str(pid)], capture_output=True
+            )
+            closed = r.returncode == 0
+        v = snap.value
+        note = "text 含焦点窗口与控件结构；files 是截图路径；继续操作用 wmcp_call"
+        if close_after and not closed:
+            note += "；窗口未能自动关闭（提权进程或已退出）"
+        return Ok({
+            "launched": started, "exe": str(exe), "pid": pid,
+            "text": v["text"], "files": v["files"], "closed": closed, "note": note,
+        })
 
     @plugin_entry(
         id="wmcp_status",
@@ -308,6 +404,8 @@ class SystemToolsPlugin(NekoPluginBase):
         ]
         return Ok({"count": len(rows), "tools": rows[:100]})
 
+    @ui.action(label="截取当前桌面", tone="default", group="operate", order=20,
+               refresh_context=False)
     @plugin_entry(
         id="wmcp_call",
         name="调用 Windows-MCP",
@@ -355,6 +453,35 @@ class SystemToolsPlugin(NekoPluginBase):
         if self._wmcp_client is not None:
             await asyncio.to_thread(self._wmcp_client.stop)
         return Ok({"status": "stopped"})
+    # --------------------------------------------------------------------- ui
+
+    @ui.context(id="system_tools_panel", title="系统工具面板")
+    async def panel_context(self):
+        """只读状态，给 TSX 面板当 props.state。不拉起 wmcp 子进程。"""
+        r = await self.status()
+        v = r.value if isinstance(r, Ok) else {}
+        full, _ = await self._wmcp_cfg()
+        c = self._wmcp_client
+        reg = v.get("tuba") or {}
+        return {
+            "sysinternals": {
+                "root": v.get("sysinternals_root"),
+                "tools": v.get("sysinternals_tools", 0),
+                "zip_present": bool(v.get("sysinternals_zip_present")),
+            },
+            "tuba": {
+                "installed": bool(v.get("tuba_installed")),
+                "version": reg.get("version"),
+                "main_exe": v.get("tuba_main_exe"),
+                "installer": v.get("tuba_installer"),
+            },
+            "wmcp": {
+                "uvx_found": shutil.which(full[0]) is not None,
+                "alive": bool(c and c.alive),
+                "tools": len(c.tools) if c else 0,
+            },
+        }
+
     # ----------------------------------------------------------------- llm_tool
 
     @llm_tool(
@@ -363,8 +490,10 @@ class SystemToolsPlugin(NekoPluginBase):
             "PC 系统工具支持。Sysinternals 套件：sys_list 列工具（keyword 可过滤）、"
             "sys_run 运行（tool=工具名如 Procexp64/pingview/accesschk/hex2dec，args=参数串，"
             "GUI 工具 wait=false 只启动，命令行工具 wait=true 等输出）、sys_setup 从 zip 解包。"
-            "图吧工具箱：tuba_detect 检测安装、tuba_launch 启动、tuba_download 下载安装包、"
-            "tuba_install 运行安装包（silent=true 静默）。action=status 看两边现状。"
+            "图吧工具箱：tuba_detect 检测安装、tuba_launch 启动、tuba_update 探测最新版并下载安装"
+            "（已装即最新会跳过）、tuba_install 手动跑指定安装包。action=status 看两边现状。"
+            "操控软件：operate_tool 启动 GUI（source=sysinternals/tuba）并抓界面快照+截图，"
+            "再用 wmcp_call 的 Click/Type/Shortcut/Scroll 操作、Snapshot 复查。"
             "Windows-MCP 桌面自动化：wmcp_status 看就绪、wmcp_list 列工具（keyword 过滤）、"
             "wmcp_call 调用（tool=工具名，args=参数 JSON 对象串，如 {\"x\":100,\"y\":200}）；会真实操作鼠标键盘屏幕。"
             "PowerShell/FileSystem/Registry/Process/Clipboard 默认拦截，allow 配置可放行。"
@@ -375,17 +504,20 @@ class SystemToolsPlugin(NekoPluginBase):
                 "action": {
                     "type": "string",
                     "enum": ["status", "sys_list", "sys_run", "sys_setup",
-                             "tuba_detect", "tuba_launch", "tuba_download", "tuba_install",
-                             "wmcp_status", "wmcp_list", "wmcp_call"],
+                             "tuba_detect", "tuba_launch", "tuba_update", "tuba_install",
+                             "operate_tool", "wmcp_status", "wmcp_list", "wmcp_call"],
                     "description": "要做的操作",
                 },
                 "tool": {"type": "string", "description": "sys_run=Sysinternals 工具名；wmcp_call=Windows-MCP 工具名"},
+                "source": {"type": "string", "description": "operate_tool 的工具来源：sysinternals 或 tuba"},
+                "name": {"type": "string", "description": "operate_tool 的 Sysinternals 工具名（tuba 忽略）"},
+                "force": {"type": "boolean", "description": "tuba_update 版本相同也强制重装"},
                 "args": {"type": "string", "description": "sys_run 的参数串；wmcp_call 的参数 JSON 对象串"},
                 "wait": {"type": "boolean", "description": "sys_run 是否等输出，GUI 工具填 false"},
                 "keyword": {"type": "string", "description": "sys_list 过滤关键字"},
                 "zip_path": {"type": "string", "description": "sys_setup 的 zip 路径，空用默认"},
                 "path": {"type": "string", "description": "tuba_launch/tuba_install 的文件路径，空自动定位"},
-                "silent": {"type": "boolean", "description": "tuba_install 是否静默安装"},
+                "silent": {"type": "boolean", "description": "tuba_install/tuba_update 是否静默安装"},
             },
             "required": ["action"],
         },
@@ -402,6 +534,9 @@ class SystemToolsPlugin(NekoPluginBase):
         zip_path: str = "",
         path: str = "",
         silent: bool = False,
+        source: str = "sysinternals",
+        name: str = "",
+        force: bool = False,
     ):
         if action == "status":
             r = await self.status()
@@ -415,10 +550,12 @@ class SystemToolsPlugin(NekoPluginBase):
             r = await self.tuba_detect()
         elif action == "tuba_launch":
             r = await self.tuba_launch(path)
-        elif action == "tuba_download":
-            r = await self.tuba_download("", "")
+        elif action == "tuba_update":
+            r = await self.tuba_update(force, silent)
         elif action == "tuba_install":
             r = await self.tuba_install(path, silent)
+        elif action == "operate_tool":
+            r = await self.operate_tool(source, name)
         elif action == "wmcp_status":
             r = await self.wmcp_status()
         elif action == "wmcp_list":

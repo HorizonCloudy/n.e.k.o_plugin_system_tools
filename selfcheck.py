@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _tools import (  # noqa: E402
+    TUBA_URL_TEMPLATE,
     decode_output,
     download_file,
     extract_zip,
@@ -17,7 +18,10 @@ from _tools import (  # noqa: E402
     run_exe,
     safe_tool_exe,
     split_args,
+    tuba_candidate_months,
+    tuba_find_latest,
     tuba_from_registry,
+    tuba_version_key,
 )
 
 tmp = Path(tempfile.mkdtemp())
@@ -60,6 +64,33 @@ assert not (tmp / "dest" / "sub").exists()
 assert not download_file("ftp://x/y.exe", tmp)["ok"]
 assert not download_file("https://invalid.invalid/x.exe", tmp)["ok"]
 
+# 最新版探测：纯函数 + 假 probe，不联网
+assert tuba_version_key("2026.08") == "202608"
+assert tuba_version_key("图吧工具箱202608") == "202608"
+assert tuba_version_key("v2026.8") == "202608"
+assert tuba_version_key("") == ""
+assert tuba_version_key("2026.13") == ""
+assert tuba_candidate_months(2026, 1)[:3] == ["202601", "202512", "202511"]
+assert len(tuba_candidate_months(2026, 12, 12)) == 12
+import datetime  # noqa: E402
+
+seen = []
+
+
+def fake_probe(u):
+    seen.append(u)
+    return "202608" in u
+
+
+r = tuba_find_latest("202512", today=datetime.date(2026, 11, 13), probe=fake_probe)
+assert r["ok"] and r["month"] == "202608" and r["newer"] is True, r
+assert r["url"] == TUBA_URL_TEMPLATE.replace("{ym}", "202608")
+r = tuba_find_latest("202608", today=datetime.date(2026, 11, 13), probe=fake_probe)
+assert r["ok"] and r["month"] == "202608" and r["newer"] is False, r
+r = tuba_find_latest("", today=datetime.date(2026, 11, 13), probe=lambda u: False)
+assert r["ok"] and r["month"] == "" and r["newer"] is False, r
+assert tuba_find_latest("202608", template="https://x/y.exe")["ok"] is False
+
 # 真跑 Sysinternals（本机）
 suite = Path(r"D:\SysinternalsSuite")
 if (suite / "hex2dec.exe").is_file():
@@ -67,6 +98,9 @@ if (suite / "hex2dec.exe").is_file():
     assert out["mode"] == "exited" and "42" in out["stdout"], out
     gui = run_exe(suite / "hex2dec.exe", [], wait=False, timeout_seconds=1, accept_eula=True)
     assert gui["mode"] == "launched" and gui["pid"] > 0
+bad = tmp / "badgui.exe"
+bad.write_bytes(b"not a pe")
+assert run_exe(bad, [], wait=False, timeout_seconds=1, accept_eula=True)["mode"] == "error"
 
 # 真读注册表（本机）
 reg = tuba_from_registry()
