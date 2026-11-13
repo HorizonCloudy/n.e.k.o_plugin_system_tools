@@ -33,6 +33,14 @@ from _tools import (  # noqa: E402
     tuba_from_registry,
     tuba_version_key,
 )
+from windows_mcp import (
+    DEFAULT_BLOCKED,
+    WmcpClient,
+    WmcpError,
+    blocked_tools,
+    decode_line,
+    encode_msg,
+)
 
 tmp = Path(tempfile.mkdtemp())
 
@@ -193,14 +201,6 @@ FAKE = (
 )
 fake = tmp / "fake_wmcp.py"
 fake.write_text(FAKE, encoding="utf-8")
-from windows_mcp import (  # noqa: E402
-    DEFAULT_BLOCKED,
-    WmcpClient,
-    WmcpError,
-    blocked_tools,
-    decode_line,
-    encode_msg,
-)
 
 assert decode_line(encode_msg({"a": 1})) == {"a": 1}
 assert decode_line(b"not json") is None
