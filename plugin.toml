@@ -1,0 +1,58 @@
+[plugin]
+id = "system_tools"
+name = "PC 系统工具支持"
+description = "Sysinternals Suite + 图吧工具箱。Sysinternals：优先用现成目录，没有就从本地 zip 解包，然后列工具、跑工具（命令行类捕获输出，GUI 类只启动），自动带 /accepteula。图吧工具箱：从卸载注册表定位安装、启动主程序，还能下载 202608 安装包并运行（可选 /SILENT 静默）。工具名按纯文件名校验，只跑套件目录内的程序；不注入被启动的工具，不主动提权。Windows-MCP：拉起 CursorTouch/Windows-MCP 的 stdio 服务器（uvx windows-mcp serve），代理它的鼠标/键盘/截图/窗口类工具；截图落盘回路径。"
+short_description = "Sysinternals Suite + 图吧工具箱 + Windows-MCP：解包 / 检测 / 列出 / 运行 / 下载 / 桌面自动化。"
+keywords = [
+    "Sysinternals",
+    "图吧工具箱",
+    "系统工具",
+    "诊断",
+    "进程",
+    "硬件检测",
+    "Procexp",
+    "accesschk",
+    "toolbox",
+    "Windows-MCP",
+    "mcp",
+    "桌面自动化",
+    "截图",
+]
+version = "0.3.0"
+type = "plugin"
+entry = "plugin.plugins.system_tools:SystemToolsPlugin"
+
+[plugin.author]
+name = "local"
+
+[plugin.sdk]
+recommended = ">=0.1.0,<0.2.0"
+supported = ">=0.1.0,<0.3.0"
+
+[plugin_runtime]
+enabled = true
+auto_start = true
+
+# ---------------------------------------------------------------------------
+# 业务配置：安装后这一段会被复制到用户数据目录 config/plugin.toml。
+# ---------------------------------------------------------------------------
+
+[sysinternals]
+# 现成的 Sysinternals 套件目录（含 *.exe）。留空 = 只用插件解包出来的副本。
+root = "D:\\SysinternalsSuite"
+
+# 官方 SysinternalsSuite.zip 的路径。留空 = %USERPROFILE%\Downloads\SysinternalsSuite.zip
+zip = "C:\\Users\\54301\\Downloads\\SysinternalsSuite.zip"
+
+[tuba]
+# 图吧工具箱 202608 安装包下载地址。
+url = "https://apac.tualatin.club/%E5%9B%BE%E5%90%A7%E5%B7%A5%E5%85%B7%E7%AE%B1202608%E5%AE%89%E8%A3%85%E5%8C%85.exe"
+
+[windows_mcp]
+# Windows-MCP 启动命令（stdio MCP server）。默认 uvx；首次运行会拉 Python 3.13+ 和依赖。
+command = "uvx"
+args = "windows-mcp serve"
+start_timeout_seconds = 240
+# 默认拦截的系统级工具（PowerShell/FileSystem/Registry/Process/Clipboard）。blocked 给值=整表覆盖；allow 逗号名单=从拦截表摘除。
+blocked = ""
+allow = ""
