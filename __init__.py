@@ -1,7 +1,8 @@
 """system_tools：把 Sysinternals Suite 和图吧工具箱的能力交给 N.E.K.O.。
 
 Sysinternals 优先用现成目录，没有就从 zip 解包到插件数据目录；图吧工具箱经
-卸载注册表定位，可启动主程序、探测并安装最新版。全部文件/进程操作在本插件
+卸载注册表定位，可启动主程序、探测并安装最新版（留 SHA256/签名痕）。高危工具
+默认禁跑（allow_danger 可放行），tuba path 限受控目录，启动与桌面调用写审计日志。全部文件/进程操作在本插件
 独立进程内完成，不注入被启动的工具，不主动提权。
 """
 from __future__ import annotations
@@ -55,6 +56,17 @@ class SystemToolsPlugin(NekoPluginBase):
         except Exception:
             return Path.cwd() / sub
 
+    def _audit(self, event: str, **kw) -> None:
+        """审计日志：一行一条 JSON 追加到数据目录 audit/audit.log，含高危拦截。"""
+        try:
+            line = json.dumps({"ts": round(time.time(), 3), "event": event, **kw}, ensure_ascii=False, default=str)
+            d = self._data("audit")
+            d.mkdir(parents=True, exist_ok=True)
+            with (d / "audit.log").open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except Exception:
+            pass
+
     async def _sys_root(self) -> Path | None:
         """配置目录优先，其次插件解包目录。"""
         cfg = await self._sec("sysinternals")
@@ -71,7 +83,9 @@ class SystemToolsPlugin(NekoPluginBase):
     async def _wmcp_cfg(self) -> tuple[list[str], float]:
         cfg = await self._sec("windows_mcp")
         cmd = str(cfg.get("command") or "uvx")
-        args = str(cfg.get("args") or "windows-mcp serve")
+        args = str(cfg.get("args") or "").strip()
+        if not args or args == "windows-mcp serve":
+            args = _wmcp.DEFAULT_ARGS  # 钉死实测版本，防上游行为漂移
         timeout = float(cfg.get("start_timeout_seconds") or 240)
         return [cmd] + _tools.split_args(args), timeout
 
@@ -176,11 +190,18 @@ class SystemToolsPlugin(NekoPluginBase):
         exe = _tools.safe_tool_exe(root, tool)
         if exe is None:
             return Err(SdkError(f"工具不存在或名称非法: {tool}"))
+        scfg = await self._sec("sysinternals")
+        allow = {a for a in str(scfg.get("allow_danger") or "").split(",") if a.strip()}
+        if _tools.danger_tool(tool) and not _tools.danger_allowed(tool, allow):
+            self._audit("danger_blocked", via="sys_run", tool=tool)
+            return Err(SdkError(f"{tool} 属高危工具（远控/杀进程/删文件类），默认禁跑。确需使用把其名加入配置 [sysinternals].allow_danger。"))
         argv = _tools.split_args(args)
         capped = max(1, min(int(timeout_seconds or 20), 150))
         result = await asyncio.to_thread(
-            _tools.run_exe, exe, argv, wait=wait, timeout_seconds=capped, accept_eula=True
+            _tools.run_exe, exe, argv, wait=wait, timeout_seconds=capped,
+            accept_eula=bool(scfg.get("auto_accept_eula", True)),
         )
+        self._audit("sys_run", tool=tool, wait=wait, mode=result.get("mode"))
         if result.get("mode") == "error":
             return Err(SdkError(f"{result.get('tool')}: {result.get('note')}"))
         return Ok(result)
@@ -205,15 +226,21 @@ class SystemToolsPlugin(NekoPluginBase):
         description="打开图吧工具箱主程序。path 留空时自动按注册表定位。",
         timeout=30,
     )
-    async def tuba_launch(self, path: Annotated[str, "主程序 exe 绝对路径；空=自动检测"] = ""):
-        exe = Path(path) if path else None
-        if exe is None:
-            reg = await asyncio.to_thread(_tools.tuba_from_registry)
+    async def tuba_launch(self, path: Annotated[str, "主程序 exe 绝对路径；空=自动检测；只允许图吧安装目录/插件数据目录内"] = ""):
+        reg = await asyncio.to_thread(_tools.tuba_from_registry)
+        if path:
+            roots = [(reg or {}).get("install_location") or "", str(self._data("tuba"))]
+            if not _tools.path_is_under(path, *roots):
+                self._audit("tuba_launch_denied", path=path)
+                return Err(SdkError("path 只允许图吧安装目录或插件数据目录内的现有文件（防任意 exe 执行）。"))
+            exe = Path(path)
+        else:
             exe = await asyncio.to_thread(_tools.find_tuba_exe, reg["install_location"]) if reg else None
         if exe is None or not Path(exe).is_file():
             return Err(SdkError("找不到图吧工具箱主程序。给出 path 参数，或先 tuba_detect 看安装位置。"))
         exe = Path(exe)
         p = await asyncio.to_thread(subprocess.Popen, [str(exe)], cwd=str(exe.parent))
+        self._audit("tuba_launch", exe=str(exe), pid=p.pid)
         return Ok({"mode": "launched", "pid": p.pid, "exe": str(exe)})
 
     @ui.action(label="检查并安装最新版", tone="primary", group="tuba", order=20,
@@ -247,10 +274,13 @@ class SystemToolsPlugin(NekoPluginBase):
         if not found["newer"] and not force:
             return Ok({"updated": False, "installed_before": before, "latest_month": found["month"],
                        "reason": f"已装 {installed_key} 即最新，跳过"})
-        dl = await asyncio.to_thread(_tools.download_file, found["url"], self._data("tuba"))
+        pin = str(cfg.get("sha256") or "")
+        dl = await asyncio.to_thread(_tools.download_file, found["url"], self._data("tuba"), "", pin)
         if not dl.get("ok"):
+            self._audit("tuba_download_failed", url=found["url"], error=dl.get("error"))
             return Err(SdkError("下载失败: " + str(dl.get("error"))))
         exe = Path(dl["file"])
+        sig = await asyncio.to_thread(_tools.signature_state, exe)
         exit_code = None
         installed_after = None
         note = ""
@@ -271,10 +301,15 @@ class SystemToolsPlugin(NekoPluginBase):
         else:
             p = await asyncio.to_thread(subprocess.Popen, [str(exe)], cwd=str(exe.parent))
             note = f"交互式安装器已启动 pid={p.pid}，需用户手动点完"
+        if sig != "trusted":
+            note = (note + f"；安装包签名状态 {sig}（信息级，不阻断，第三方镜像来源请自行判断）").strip("；")
+        self._audit("tuba_update", updated=True, month=found["month"], sha256=dl.get("sha256"),
+                    signature=sig, exit_code=exit_code)
         return Ok({
             "updated": True, "installed_before": before,
             "installed_before_key": installed_key, "latest_month": found["month"],
-            "installer": str(exe), "bytes": dl.get("bytes"), "silent": silent,
+            "installer": str(exe), "bytes": dl.get("bytes"), "sha256": dl.get("sha256"),
+            "reused": bool(dl.get("reused")), "signature": sig, "silent": silent,
             "exit_code": exit_code, "installed_after": installed_after, "note": note,
         })
 
@@ -289,18 +324,22 @@ class SystemToolsPlugin(NekoPluginBase):
         path: Annotated[str, "安装包绝对路径；空=数据目录最新 exe"] = "",
         silent: Annotated[bool, "静默安装"] = False,
     ):
+        tuba_dir = self._data("tuba")
         if path:
+            if not _tools.path_is_under(path, str(tuba_dir)):
+                self._audit("tuba_install_denied", path=path)
+                return Err(SdkError("安装包只允许来自插件数据目录 tuba/（先 tuba_update 下载）。"))
             exe = Path(path)
         else:
-            tuba_dir = self._data("tuba")
             cands = sorted(
                 tuba_dir.glob("*.exe"), key=lambda p: p.stat().st_mtime, reverse=True
             ) if tuba_dir.is_dir() else []
             exe = cands[0] if cands else None
         if exe is None or not exe.is_file():
             return Err(SdkError("没找到安装包。先调 tuba_update。"))
-        cmd = [str(exe)] + (["/SILENT"] if silent else [])
+        cmd = [str(exe), "/VERYSILENT", "/NORESTART"] if silent else [str(exe)]
         p = await asyncio.to_thread(subprocess.Popen, cmd, cwd=str(exe.parent))
+        self._audit("tuba_install", installer=str(exe), silent=silent, pid=p.pid)
         return Ok({"mode": "launched", "pid": p.pid, "installer": str(exe), "silent": bool(silent)})
 
     # ---------------------------------------------------------------- windows_mcp
@@ -334,9 +373,19 @@ class SystemToolsPlugin(NekoPluginBase):
                 return Err(SdkError("找不到图吧工具箱主程序。先 tuba_update 安装。"))
         else:
             return Err(SdkError("source 只能是 sysinternals 或 tuba"))
+        scfg = await self._sec("sysinternals")
+        allow = {a for a in str(scfg.get("allow_danger") or "").split(",") if a.strip()}
+        if source == "sysinternals" and _tools.danger_tool(name) and not _tools.danger_allowed(name, allow):
+            self._audit("danger_blocked", via="operate_tool", tool=name)
+            return Err(SdkError(f"{name} 属高危工具，默认禁跑；确需使用加入配置 [sysinternals].allow_danger。"))
         started = await asyncio.to_thread(
-            _tools.run_exe, exe, [], wait=False, timeout_seconds=1, accept_eula=True
+            _tools.run_exe, exe, [], wait=False, timeout_seconds=1,
+            accept_eula=bool(scfg.get("auto_accept_eula", True)),
         )
+        self._audit("operate_launch", source=source, tool=name or exe.name,
+                    mode=started.get("mode"), pid=started.get("pid"))
+        if started.get("mode") == "error":
+            return Err(SdkError(f"{started.get('tool')}: {started.get('note')}"))
         await asyncio.sleep(max(1, min(int(wait_seconds or 3), 30)))
         snap = await self.wmcp_call("Snapshot", "")
         if not isinstance(snap, Ok):
@@ -395,7 +444,8 @@ class SystemToolsPlugin(NekoPluginBase):
             return Err(SdkError(str(exc)))
         kw = (keyword or "").lower()
         wcfg = await self._sec("windows_mcp")
-        blocked = _wmcp.blocked_tools(str(wcfg.get("blocked") or ""), str(wcfg.get("allow") or ""))
+        blocked = _wmcp.blocked_tools(str(wcfg.get("blocked") or ""), str(wcfg.get("allow") or ""),
+                                      replace=bool(wcfg.get("replace_blocked")))
         rows = [
             {"name": t.get("name", ""), "blocked": t.get("name", "").casefold() in blocked,
              "description": (t.get("description") or "")[:200]}
@@ -421,7 +471,8 @@ class SystemToolsPlugin(NekoPluginBase):
         full, timeout = await self._wmcp_cfg()
         client = self._wmcp_get(full, timeout)
         wcfg = await self._sec("windows_mcp")
-        blocked = _wmcp.blocked_tools(str(wcfg.get("blocked") or ""), str(wcfg.get("allow") or ""))
+        blocked = _wmcp.blocked_tools(str(wcfg.get("blocked") or ""), str(wcfg.get("allow") or ""),
+                                      replace=bool(wcfg.get("replace_blocked")))
         if tool.strip().casefold() in blocked:
             return Err(SdkError(
                 f"{tool.strip()} 已被默认拦截（系统级破坏面）。"
@@ -443,7 +494,8 @@ class SystemToolsPlugin(NekoPluginBase):
                 texts.append(str(part.get("text", "")))
             elif part.get("type") == "image" and part.get("data"):
                 files.append(await asyncio.to_thread(self._save_wmcp_image, tool, part))
-        text = "\n".join(texts)[:4000]
+        text = (_tools.UNTRUSTED_TEXT_HEADER + "\n".join(texts))[:4000]
+        self._audit("wmcp_call", tool=tool, args=str(args_json)[:200], is_error=result["is_error"])
         if result["is_error"]:
             return Err(SdkError(f"{tool}: {text or '工具报错，无文本输出'}"[:400]))
         return Ok({"tool": tool, "text": text, "files": files})
@@ -496,7 +548,10 @@ class SystemToolsPlugin(NekoPluginBase):
             "再用 wmcp_call 的 Click/Type/Shortcut/Scroll 操作、Snapshot 复查。"
             "Windows-MCP 桌面自动化：wmcp_status 看就绪、wmcp_list 列工具（keyword 过滤）、"
             "wmcp_call 调用（tool=工具名，args=参数 JSON 对象串，如 {\"x\":100,\"y\":200}）；会真实操作鼠标键盘屏幕。"
-            "PowerShell/FileSystem/Registry/Process/Clipboard 默认拦截，allow 配置可放行。"
+            "Windows-MCP 的 PowerShell/FileSystem/Registry/Process/Clipboard 默认拦截，allow 配置可放行。"
+            "安全边界：Sysinternals 高危工具（psexec/pskill/sdelete/handle/livekd/reg 等）默认禁跑，"
+            "配置 allow_danger 放行；tuba_launch/tuba_install 的 path 只允许受控目录；"
+            "下载留 SHA256 与签名状态；启动与桌面调用写审计日志。"
         ),
         parameters={
             "type": "object",
@@ -517,11 +572,14 @@ class SystemToolsPlugin(NekoPluginBase):
                 "keyword": {"type": "string", "description": "sys_list 过滤关键字"},
                 "zip_path": {"type": "string", "description": "sys_setup 的 zip 路径，空用默认"},
                 "path": {"type": "string", "description": "tuba_launch/tuba_install 的文件路径，空自动定位"},
-                "silent": {"type": "boolean", "description": "tuba_install/tuba_update 是否静默安装"},
+                "silent": {"type": "boolean", "description": "tuba_update/tuba_install 是否静默安装；省略=tuba_update 静默、tuba_install 交互"},
+                "timeout_seconds": {"type": "integer", "description": "sys_run wait=true 最多等多少秒（上限 150）"},
+                "wait_seconds": {"type": "integer", "description": "operate_tool 启动后等几秒截屏（1~30）"},
+                "close_after": {"type": "boolean", "description": "operate_tool 截屏后按 pid 关闭该程序"},
             },
             "required": ["action"],
         },
-        timeout=300.0,
+        timeout=300.0,  # main_server 硬上限 300s；长任务靠 tuba_update 重跑复用，勿调大
     )
     async def system_tools(
         self,
@@ -533,17 +591,20 @@ class SystemToolsPlugin(NekoPluginBase):
         keyword: str = "",
         zip_path: str = "",
         path: str = "",
-        silent: bool = False,
+        silent: bool | None = None,
         source: str = "sysinternals",
         name: str = "",
         force: bool = False,
+        timeout_seconds: int = 20,
+        wait_seconds: int = 3,
+        close_after: bool = False,
     ):
         if action == "status":
             r = await self.status()
         elif action == "sys_list":
             r = await self.sysinternals_list(keyword)
         elif action == "sys_run":
-            r = await self.sysinternals_run(tool, args, wait)
+            r = await self.sysinternals_run(tool, args, wait, timeout_seconds)
         elif action == "sys_setup":
             r = await self.sysinternals_setup(zip_path)
         elif action == "tuba_detect":
@@ -551,11 +612,11 @@ class SystemToolsPlugin(NekoPluginBase):
         elif action == "tuba_launch":
             r = await self.tuba_launch(path)
         elif action == "tuba_update":
-            r = await self.tuba_update(force, silent)
+            r = await self.tuba_update(force, True if silent is None else silent)
         elif action == "tuba_install":
-            r = await self.tuba_install(path, silent)
+            r = await self.tuba_install(path, False if silent is None else silent)
         elif action == "operate_tool":
-            r = await self.operate_tool(source, name)
+            r = await self.operate_tool(source, name, wait_seconds, close_after)
         elif action == "wmcp_status":
             r = await self.wmcp_status()
         elif action == "wmcp_list":

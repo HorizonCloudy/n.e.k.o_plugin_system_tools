@@ -28,12 +28,21 @@ CHILD_ENV = {"POSTHOG_API_KEY": ""}
 DEFAULT_BLOCKED = frozenset({"powershell", "filesystem", "registry", "process", "clipboard"})
 
 
-def blocked_tools(blocked_csv: str = "", allow_csv: str = "") -> frozenset:
-    """默认拦截系统级破坏面；blocked_csv 给则整表覆盖，allow_csv 从表中摘除。"""
-    if (blocked_csv or "").strip():
-        base = {t.strip().casefold() for t in blocked_csv.split(",") if t.strip()}
+# uvx 默认启动命令：钉死 windows-mcp 0.8.9（本插件按该版本实测）。
+DEFAULT_ARGS = "--from windows-mcp==0.8.9 windows-mcp serve"
+
+
+def blocked_tools(blocked_csv: str = "", allow_csv: str = "", replace: bool = False) -> frozenset:
+    """默认拦截系统级破坏面。
+
+    blocked_csv 默认是【追加】到拦截表；replace=True 才整表覆盖（旧行为）。
+    allow_csv 从表中摘除。
+    """
+    extra = {t.strip().casefold() for t in (blocked_csv or "").split(",") if t.strip()}
+    if (blocked_csv or "").strip() and replace:
+        base = set(extra)
     else:
-        base = set(DEFAULT_BLOCKED)
+        base = set(DEFAULT_BLOCKED) | extra
     drop = {t.strip().casefold() for t in (allow_csv or "").split(",") if t.strip()}
     return frozenset(base - drop)
 

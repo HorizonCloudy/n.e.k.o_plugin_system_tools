@@ -10,6 +10,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _tools import (  # noqa: E402
     TUBA_URL_TEMPLATE,
+    UNTRUSTED_TEXT_HEADER,
+    danger_allowed,
+    danger_tool,
     decode_output,
     download_file,
     extract_zip,
@@ -17,6 +20,8 @@ from _tools import (  # noqa: E402
     list_tools,
     run_exe,
     safe_tool_exe,
+    path_is_under,
+    signature_state,
     split_args,
     tuba_candidate_months,
     tuba_find_latest,
@@ -63,6 +68,61 @@ assert not (tmp / "dest" / "sub").exists()
 # 下载参数校验（不真联网）
 assert not download_file("ftp://x/y.exe", tmp)["ok"]
 assert not download_file("https://invalid.invalid/x.exe", tmp)["ok"]
+
+# 安全边界纯函数
+assert danger_tool("psexec64.exe") and danger_tool("PsExec.exe") and danger_tool("reg")
+assert danger_tool("sdelete") and danger_tool("handle.exe") and danger_tool("RegDelNull64.exe")
+assert not danger_tool("hex2dec.exe") and not danger_tool("regjump") and not danger_tool("Procexp64")
+assert not danger_tool("disk2vhd64.exe")  # 磁盘成像是低风险，不在名单
+assert danger_allowed("psexec64.exe", {"psexec"})
+assert danger_allowed("PsExec", {"PsExec.exe"})
+assert not danger_allowed("psexec", set())
+ok_file = tmp / "under_ok.exe"
+ok_file.write_bytes(b"x")
+assert path_is_under(str(ok_file), str(tmp))
+assert not path_is_under(str(tmp.parent / "other.exe"), str(tmp))
+assert not path_is_under(str(r"D:\Windows\System32\notepad.exe" if sys.platform == "win32" else "/bin/ls"), str(tmp))
+assert not path_is_under(str(tmp / "missing.exe"), str(tmp))
+assert signature_state(Path(__file__)) in ("unsigned", "trusted", "skip") or signature_state(Path(__file__)).startswith(("untrusted", "error"))
+
+# 下载带哈希：本地回环小服务器，不碰外网
+import http.server
+import socketserver
+import threading
+
+
+class _H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):  # noqa: N802
+        body = b"payload-123"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+with socketserver.TCPServer(("127.0.0.1", 0), _H) as srv:
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    got = download_file(f"http://127.0.0.1:{port}/pk.exe", tmp / "dl")
+    srv.shutdown()
+import hashlib as _hl
+assert got["ok"] and got["sha256"] == _hl.sha256(b"payload-123").hexdigest().upper(), got
+with socketserver.TCPServer(("127.0.0.1", 0), _H) as srv2:
+    port2 = srv2.server_address[1]
+    threading.Thread(target=srv2.serve_forever, daemon=True).start()
+    bad = download_file(f"http://127.0.0.1:{port2}/pk.exe", tmp / "dl2", expected_sha256="0" * 64)
+    srv2.shutdown()
+assert not bad["ok"] and "SHA256 不符" in bad["error"] and "file" not in bad
+with socketserver.TCPServer(("127.0.0.1", 0), _H) as srv3:
+    port3 = srv3.server_address[1]
+    threading.Thread(target=srv3.serve_forever, daemon=True).start()
+    again = download_file(f"http://127.0.0.1:{port3}/pk.exe", tmp / "dl")
+    srv3.shutdown()
+assert again["ok"] and again.get("reused") is True and again["sha256"] == got["sha256"]
+assert UNTRUSTED_TEXT_HEADER.startswith("⚠")
 
 # 最新版探测：纯函数 + 假 probe，不联网
 assert tuba_version_key("2026.08") == "202608"
@@ -132,14 +192,23 @@ FAKE = (
 )
 fake = tmp / "fake_wmcp.py"
 fake.write_text(FAKE, encoding="utf-8")
-from windows_mcp import WmcpClient, WmcpError, blocked_tools, decode_line, encode_msg  # noqa: E402
+from windows_mcp import (  # noqa: E402
+    DEFAULT_BLOCKED,
+    WmcpClient,
+    WmcpError,
+    blocked_tools,
+    decode_line,
+    encode_msg,
+)
 
 assert decode_line(encode_msg({"a": 1})) == {"a": 1}
 assert decode_line(b"not json") is None
 assert "powershell" in blocked_tools()
 assert "screenshot" not in blocked_tools()
-assert blocked_tools("registry", "") == frozenset({"registry"})
-assert blocked_tools("", "PowerShell") == frozenset({"filesystem", "registry", "process", "clipboard"})
+# 追加语义：blocked 给值默认是加进表，不是替换表
+assert blocked_tools("registry", "") == frozenset(set(DEFAULT_BLOCKED) | {"registry"})
+assert blocked_tools("registry", "", replace=True) == frozenset({"registry"})
+assert blocked_tools("", "PowerShell") == frozenset(set(DEFAULT_BLOCKED) - {"powershell"})
 assert blocked_tools("", "powershell,filesystem,registry,process,clipboard") == frozenset()
 
 client = WmcpClient(cmd=[sys.executable, str(fake)], start_timeout=20, request_timeout=20)

@@ -30,6 +30,26 @@ def test_blocked_tools() -> None:
     assert "powershell" in blocked_tools()
     assert blocked_tools("", "PowerShell") == frozenset({"filesystem", "registry", "process", "clipboard"})
 
+
+def test_blocked_tools_append_semantics() -> None:
+    from windows_mcp import DEFAULT_BLOCKED
+
+    assert blocked_tools("registry", "") == frozenset(set(DEFAULT_BLOCKED) | {"registry"})
+    assert blocked_tools("registry", "", replace=True) == frozenset({"registry"})
+
+
+def test_danger_and_path_guards(tmp_path: Path) -> None:
+    from _tools import danger_allowed, danger_tool, path_is_under
+
+    assert danger_tool("psexec64.exe") and danger_tool("sdelete") and danger_tool("RegDelNull64.exe")
+    assert not danger_tool("regjump") and not danger_tool("Procexp64")
+    assert danger_allowed("PsExec64.exe", {"psexec"}) and not danger_allowed("psexec", set())
+    f = tmp_path / "x.exe"
+    f.write_bytes(b"x")
+    assert path_is_under(str(f), str(tmp_path))
+    assert not path_is_under(str(tmp_path.parent / "y.exe"), str(tmp_path))
+    assert not path_is_under(str(f), "")
+
 def test_tuba_version_key() -> None:
     assert tuba_version_key("2026.08") == "202608"
     assert tuba_version_key("图吧工具箱202608") == "202608"
