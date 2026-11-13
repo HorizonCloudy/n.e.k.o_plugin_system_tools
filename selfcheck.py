@@ -1,8 +1,13 @@
 """纯逻辑自检：python selfcheck.py。不需要宿主、不需要 pytest。"""
 from __future__ import annotations
 
+import datetime
+import hashlib as _hl
+import http.server
+import socketserver
 import sys
 import tempfile
+import threading
 import zipfile
 from pathlib import Path
 
@@ -18,9 +23,9 @@ from _tools import (  # noqa: E402
     extract_zip,
     find_tuba_exe,
     list_tools,
+    path_is_under,
     run_exe,
     safe_tool_exe,
-    path_is_under,
     signature_state,
     split_args,
     tuba_candidate_months,
@@ -86,9 +91,6 @@ assert not path_is_under(str(tmp / "missing.exe"), str(tmp))
 assert signature_state(Path(__file__)) in ("unsigned", "trusted", "skip") or signature_state(Path(__file__)).startswith(("untrusted", "error"))
 
 # 下载带哈希：本地回环小服务器，不碰外网
-import http.server
-import socketserver
-import threading
 
 
 class _H(http.server.BaseHTTPRequestHandler):
@@ -108,7 +110,7 @@ with socketserver.TCPServer(("127.0.0.1", 0), _H) as srv:
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     got = download_file(f"http://127.0.0.1:{port}/pk.exe", tmp / "dl")
     srv.shutdown()
-import hashlib as _hl
+
 assert got["ok"] and got["sha256"] == _hl.sha256(b"payload-123").hexdigest().upper(), got
 with socketserver.TCPServer(("127.0.0.1", 0), _H) as srv2:
     port2 = srv2.server_address[1]
@@ -132,7 +134,6 @@ assert tuba_version_key("") == ""
 assert tuba_version_key("2026.13") == ""
 assert tuba_candidate_months(2026, 1)[:3] == ["202601", "202512", "202511"]
 assert len(tuba_candidate_months(2026, 12, 12)) == 12
-import datetime  # noqa: E402
 
 seen = []
 

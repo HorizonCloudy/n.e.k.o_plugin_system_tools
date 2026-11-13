@@ -10,6 +10,10 @@ on:
 
 permissions:
   contents: write
+  # plugin-market-release.yml 的构建 job 声明 id-token/attestations:write；
+  # caller 不授予就会 startup_failure（neko-plugin 模板缺这两行）。
+  id-token: write
+  attestations: write
 
 jobs:
   release:
